@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ruins of the Sunken City</title>
+  <style>
+    html, body { margin: 0; height: 100%; background:#0b0b10; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    .wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+    canvas { border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.45); background:#111; }
+    .hud {
+      position: fixed; left: 16px; top: 16px; color: rgba(255,255,255,.9);
+      background: rgba(10,10,18,.55); backdrop-filter: blur(10px);
+      padding: 10px 12px; border-radius: 12px; font-size: 14px; line-height: 1.4;
+      border: 1px solid rgba(255,255,255,.08);
+      max-width: 420px;
+      user-select:none;
+    }
+    .hud b { color: #fff; }
+    .hint { color: rgba(255,255,255,.75); font-size: 12px; margin-top: 6px; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,.10); margin-right: 6px; margin-top:6px; }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <div><b>Ruins of the Sunken City</b></div>
+    <div>
+      <span class="pill">Move: A/D or ←/→</span>
+      <span class="pill">Jump: W / ↑ / Space</span>
+      <span class="pill">Restart: R</span>
+    </div>
+    <div class="hint">
+      Collect <b>5</b> glowing energy cores to activate the portal.
+      Avoid the hot sand pits. Reach the portal to finish.
+    </div>
+    <div id="status" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="wrap">
+    <canvas id="c" width="960" height="540"></canvas>
+  </div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+
+  const W = canvas.width, H = canvas.height;
+
+  // Tuning
+  const GRAV = 1800;
+  const MOVE = 520;
+  const JUMP = 720;
+  const FRICTION = 0.86;
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const aabb = (a, b) =>
+    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  // Input
+  const keys = new Set();
+  addEventListener("keydown", (e) => {
+    keys.add(e.code);
+    if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault();
+  }, { passive:false });
+  addEventListener("keyup", (e) => keys.delete(e.code));
+  const isDown = (...codes) => codes.some(c => keys.has(c));
+
+  // Audio ping
+  let audioCtx = null;
+  function ping(freq = 660, dur = 0.08) {
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const t0 = audioCtx.currentTime;
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = "sine";
+      o.frequency.setValueAtTime(freq, t0);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(0.08, t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      o.connect(g).connect(audioCtx.destination);
+      o.start(t0);
+      o.stop(t0 + dur + 0.01);
+    } catch {}
+  }
+
+  // World
+  function makeWorld() {
+    return {
+      w: 2600, h: H,
+      platforms: [
+        { x: 0, y: 470, w: 2600, h: 70 },
+        { x: 420, y: 410, w: 180, h: 18 },
+        { x: 640, y: 360, w: 160, h: 18 },
+        { x: 840, y: 310, w: 170, h: 18 },
+        { x: 1060, y: 350, w: 220, h: 18 },
+        { x: 1340, y: 390, w: 210, h: 18 },
+        { x: 1700, y: 320, w: 240, h: 18 },
+        { x: 1980, y: 270, w: 220, h: 18 }
+      ],
+      hotSand: [
+        { x: 280, y: 505, w: 120, h: 35 },
+        { x: 1220, y: 505, w: 140, h: 35 },
+        { x: 1560, y: 505, w: 110, h: 35 },
+        { x: 2140, y: 505, w: 150, h: 35 }
+      ],
+      cores: [
+        { x: 500, y: 370, r: 12, got:false },
+        { x: 700, y: 320, r: 12, got:false },
+        { x: 900, y: 270, r: 12, got:false },
+        { x: 1160, y: 310, r: 12, got:false },
+        { x: 1460, y: 350, r: 12, got:false },
+        { x: 1760, y: 280, r: 12, got:false },
+        { x: 2060, y: 230, r: 12, got:false },
+      ],
+      portal: { x: 2380, y: 390, w: 50, h: 80 }
+    };
+  }
+
+  function makePlayer() {
+    return {
+      x: 80, y: 380, w: 34, h: 46,
+      vx: 0, vy: 0,
+      onGround: false,
+      respawnX: 80, respawnY: 380,
+      cores: 0,
+      win: false
+    };
+  }
+
+  let world = makeWorld();
+  let player = makePlayer();
+  const cam = { x: 0, y: 0 };
+
+  // Title / state
+  let state = "title"; // title | play | win
+
+  function resetAll() {
+    world = makeWorld();
+    player = makePlayer();
+    state = "title";
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = clamp((now - last) / 1000, 0, 0.033);
+    last = now;
+
+    if (isDown("KeyR")) resetAll();
+
+    if (state === "title") {
+      if (isDown("Space","Enter","ArrowUp","KeyW")) {
+        state = "play";
+        ping(520, 0.08);
+      }
+      draw(now);
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    if (state === "play") update(dt, now);
+    draw(now);
+
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  function update(dt, now) {
+    // Controls
+    const left = isDown("KeyA", "ArrowLeft");
+    const right = isDown("KeyD", "ArrowRight");
+    const jump = isDown("KeyW", "ArrowUp", "Space");
+
+    if (left && !right) player.vx = -MOVE;
+    else if (right && !left) player.vx = MOVE;
+    else player.vx *= FRICTION;
+
+    if (jump && player.onGround) {
+      player.vy = -JUMP;
+      player.onGround = false;
+      ping(240, 0.06);
+    }
+
+    player.vy += GRAV * dt;
+
+    // X
+    player.x += player.vx * dt;
+    player.x = clamp(player.x, 0, world.w - player.w);
+    collidePlatforms("x");
+
+    // Y
+    player.y += player.vy * dt;
+    player.onGround = false;
+    collidePlatforms("y");
+
+    // Hazards
+    for (const hz of world.hotSand) {
+      if (aabb(player, hz)) {
+        respawn();
+        break;
+      }
+    }
+
+    // Collect cores
+    for (const c of world.cores) {
+      if (c.got) continue;
+      const px = player.x + player.w/2, py = player.y + player.h/2;
+      const dx = px - c.x, dy = py - c.y;
+      if ((dx*dx + dy*dy) <= (c.r + 18) * (c.r + 18)) {
+        c.got = true;
+        player.cores++;
+        ping(880, 0.09);
+      }
+    }
+
+    // Win
+    if (aabb(player, world.portal) && player.cores >= 5) {
+      state = "win";
+      player.win = true;
+      ping(990, 0.18);
+      setTimeout(() => ping(1320, 0.18), 120);
+    }
+
+    cam.x = clamp(player.x - W * 0.45, 0, world.w - W);
+
+    const total = world.cores.length;
+    statusEl.innerHTML =
+      `Energy cores: <b>${player.cores}</b> / ${total} ` +
+      (player.cores < 5 ? `&nbsp; <span style="opacity:.75">(need 5 to activate portal)</span>` : `&nbsp; <b style="color:#b7ffcf">portal active</b>`);
+  }
+
+  function respawn() {
+    player.x = player.respawnX;
+    player.y = player.respawnY;
+    player.vx = 0;
+    player.vy = 0;
+    player.onGround = false;
+    ping(140, 0.08);
+  }
+
+  function collidePlatforms(axis) {
+    for (const p of world.platforms) {
+      if (!aabb(player, p)) continue;
+
+      if (axis === "x") {
+        if (player.vx > 0) player.x = p.x - player.w;
+        else if (player.vx < 0) player.x = p.x + p.w;
+        player.vx = 0;
+      } else {
+        if (player.vy > 0) {
+          player.y = p.y - player.h;
+          player.vy = 0;
+          player.onGround = true;
+          if (p.y < 470) {
+            player.respawnX = player.x;
+            player.respawnY = player.y;
+          }
+        } else if (player.vy < 0) {
+          player.y = p.y + p.h;
+          player.vy = 0;
+        }
+      }
+    }
+  }
+
+  function draw(t) {
+    const time = t * 0.001;
+
+    // Background gradient
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, "#2b1d2f");
+    bg.addColorStop(0.55, "#3b2a22");
+    bg.addColorStop(1, "#15131a");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // Stars/dust
+    for (let i=0;i<60;i++){
+      const sx = (i*97 % W);
+      const sy = (i*53 % 220);
+      const tw = 0.4 + 0.6*Math.sin(time*1.2 + i);
+      ctx.fillStyle = `rgba(255,255,255,${0.08 + 0.10*tw})`;
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+
+    ctx.save();
+    ctx.translate(-cam.x, 0);
+
+    // Backdrop ruins
+    ctx.fillStyle = "rgba(20,18,26,0.55)";
+    for (let i=0; i<12; i++){
+      const bx = i*240 + 60;
+      const by = 310 + (i%3)*18;
+      ctx.fillRect(bx, by, 80, 160);
+      ctx.fillRect(bx + 90, by + 30, 50, 130);
+      ctx.fillRect(bx - 40, by + 55, 60, 105);
+    }
+    ctx.fillStyle = "rgba(90,220,255,0.08)";
+    for (let i=0;i<9;i++){
+      const gx = i*300 + 120;
+      ctx.fillRect(gx, 350, 2, 120);
+    }
+
+    // Sand ground
+    ctx.fillStyle = "#caa87a";
+    ctx.fillRect(0, 470, world.w, 70);
+
+    // Hot sand hazards
+    for (const hz of world.hotSand) {
+      const flicker = 0.5 + 0.5*Math.sin(time*6 + hz.x*0.01);
+      ctx.fillStyle = `rgba(255,120,40,${0.55 + 0.25*flicker})`;
+      ctx.fillRect(hz.x, hz.y, hz.w, hz.h);
+      ctx.fillStyle = "rgba(255,230,180,0.14)";
+      ctx.fillRect(hz.x, hz.y, hz.w, 4);
+    }
+
+    // Platforms
+    for (const p of world.platforms) {
+      if (p.y >= 470) continue;
+      ctx.fillStyle = "#6b5b55";
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = "rgba(255,255,255,0.10)";
+      ctx.fillRect(p.x, p.y, p.w, 3);
+      ctx.fillStyle = "rgba(0,0,0,0.18)";
+      ctx.fillRect(p.x, p.y + p.h - 3, p.w, 3);
+    }
+
+    // Cores
+    for (const c of world.cores) {
+      if (c.got) continue;
+      const pulse = 0.6 + 0.4*Math.sin(time*3 + c.x*0.02);
+      ctx.beginPath();
+      ctx.fillStyle = `rgba(90,220,255,${0.65 + 0.25*pulse})`;
+      ctx.arc(c.x, c.y, c.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.fillStyle = `rgba(160,255,220,${0.20 + 0.15*pulse})`;
+      ctx.arc(c.x, c.y, c.r*2.2, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // Portal
+    const portalActive = player.cores >= 5;
+    const glow = 0.5 + 0.5*Math.sin(time*4);
+    ctx.fillStyle = portalActive ? `rgba(120,255,190,${0.22 + 0.18*glow})` : "rgba(255,255,255,0.08)";
+    ctx.fillRect(world.portal.x - 14, world.portal.y - 14, world.portal.w + 28, world.portal.h + 28);
+    ctx.fillStyle = portalActive ? "rgba(60,220,160,0.55)" : "rgba(190,190,210,0.18)";
+    ctx.fillRect(world.portal.x, world.portal.y, world.portal.w, world.portal.h);
+    ctx.fillStyle = portalActive ? "rgba(220,255,240,0.25)" : "rgba(255,255,255,0.10)";
+    ctx.fillRect(world.portal.x + 8, world.portal.y + 8, world.portal.w - 16, world.portal.h - 16);
+
+    // Player
+    ctx.fillStyle = "#e6d4b7";
+    ctx.fillRect(player.x, player.y, player.w, player.h);
+    ctx.fillStyle = "rgba(90,255,190,0.75)";
+    ctx.fillRect(player.x, player.y + 10, player.w, 8);
+    const g = 0.4 + 0.6*Math.sin(time*5);
+    ctx.fillStyle = `rgba(90,220,255,${0.35 + 0.25*g})`;
+    ctx.fillRect(player.x + 7, player.y + 6, player.w - 14, 6);
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.fillRect(player.x + 6, player.y + player.h - 6, player.w - 12, 6);
+
+    ctx.restore();
+
+    // Overlay text
+    if (state === "title") {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.font = "800 44px system-ui";
+      ctx.fillText("Ruins of the Sunken City", 150, 220);
+      ctx.font = "400 18px system-ui";
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillText("Press SPACE to begin. Collect 5 cores to activate the portal.", 170, 270);
+    }
+
+    if (state === "win") {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0,0,W,H);
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.font = "700 40px system-ui";
+      ctx.fillText("You restored the city’s power.", 160, 240);
+      ctx.font = "400 18px system-ui";
+      ctx.fillStyle = "rgba(255,255,255,0.85)";
+      ctx.fillText("Press R to restart, or refresh the page.", 290, 290);
+    }
+  }
+})();
+</script>
+</body>
+</html>
